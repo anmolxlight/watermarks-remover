@@ -86,7 +86,6 @@ INDEX_HTML = """<!doctype html>
   .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 20px; }
   label.toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; color: var(--text); }
   label.toggle input { width: 16px; height: 16px; accent-color: var(--accent-strong); cursor: pointer; }
-  .toggle-note { display: block; color: var(--dim); font-size: 12.5px; margin-top: 2px; }
   button.cta {
     background: var(--accent-strong); color: #052e1b; border: none; cursor: pointer;
     font: 600 14px/1 inherit; padding: 11px 22px; border-radius: var(--radius);
@@ -130,6 +129,8 @@ INDEX_HTML = """<!doctype html>
   footer a { color: var(--muted); text-decoration: none; }
   footer a:hover { color: var(--text); }
   input[type=file] { display: none; }
+  .dl-wrap { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  @media (max-width: 480px) { .row { flex-direction: column; align-items: stretch; } .dl-wrap { width: 100%; } a.download { flex: 1; text-align: center; } }
   @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 </style>
 </head>
@@ -147,7 +148,7 @@ INDEX_HTML = """<!doctype html>
     <div class="row">
       <label class="toggle">
         <input type="checkbox" id="rewrite">
-        <span>Neural rewrite<span class="toggle-note">mimo-v2.5 paraphrase for statistical text watermarks</span></span>
+        <span>Neural rewrite</span>
       </label>
       <button class="cta" id="go" disabled>Remove marks</button>
     </div>
@@ -158,7 +159,7 @@ INDEX_HTML = """<!doctype html>
           <div class="r-title">Cleaned</div>
           <div class="r-meta" id="rMeta"></div>
         </div>
-        <div style="display:flex;gap:10px;align-items:center;flex-shrink:0">
+        <div class="dl-wrap">
           <a class="download" id="dlText" download style="display:none">Download rewritten text</a>
           <a class="download" id="dl" download>Download PDF</a>
         </div>
@@ -453,6 +454,52 @@ def _extract_pdf_text(data: bytes) -> str:
     return "\n\n".join(p.strip() for p in pages if p.strip())
 
 
+def _text_to_pdf(text: str, page_width: float = 595, page_height: float = 842) -> bytes:
+    """Generate a clean PDF from rewritten text, paginated with margins."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    margin = 60
+    font = "helv"  # Helvetica
+    fontsize = 11
+    leading = 16
+    usable_w = page_width - 2 * margin
+    usable_h = page_height - 2 * margin
+    lines_per_page = int(usable_h / leading)
+
+    # split text into visual lines (wrap at ~95 chars)
+    raw_lines = text.split("\n")
+    wrapped: list[str] = []
+    for rl in raw_lines:
+        if len(rl) <= 95:
+            wrapped.append(rl)
+        else:
+            words = rl.split()
+            cur = ""
+            for w in words:
+                test = (cur + " " + w).strip()
+                if len(test) > 95:
+                    wrapped.append(cur)
+                    cur = w
+                else:
+                    cur = test
+            if cur:
+                wrapped.append(cur)
+
+    # paginate
+    for i in range(0, max(1, len(wrapped)), lines_per_page):
+        page = doc.new_page(width=page_width, height=page_height)
+        chunk = wrapped[i:i + lines_per_page]
+        y = margin + fontsize
+        for line in chunk:
+            page.insert_text((margin, y), line, fontname=font, fontsize=fontsize)
+            y += leading
+
+    buf = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # cleaners
 # ---------------------------------------------------------------------------
@@ -603,6 +650,7 @@ def _clean(data: bytes, name: str, options: dict[str, Any]) -> dict[str, Any]:
                 result["report"]["layer_b"] = lb
                 if lb.get("rewritten"):
                     result["text"] = rewritten
+                    result["cleaned"] = _text_to_pdf(rewritten)
             else:
                 result["report"]["layer_b"] = {"rewritten": False, "note": "no extractable text" if not text else "text too short"}
         return result
