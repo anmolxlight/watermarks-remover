@@ -536,14 +536,21 @@ def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
             page_rect.height - margin    # bottom margin
         )
 
-        # detect font size from first span on page
+        # detect dominant font (size, bold, italic) from the page's spans,
+        # weighted by span text length so the style covering the most text wins
         fs = 11
+        bold = italic = False
         try:
-            spans = blocks[0]["lines"][0]["spans"]
+            spans = [sp for b in blocks if b["type"] == 0 for l in b["lines"] for sp in l["spans"]]
             if spans:
-                fs = spans[0]["size"]
+                dom = max(spans, key=lambda s: len(s["text"]))
+                fs = dom["size"]
+                fname = dom["font"].lower()
+                bold = bool(dom["flags"] & 2**4) or "bold" in fname
+                italic = bool(dom["flags"] & 2**1) or "italic" in fname or "oblique" in fname
         except Exception:
             pass
+        fontname = {(False, False): "helv", (True, False): "hebo", (False, True): "heit", (True, True): "hebi"}[(bold, italic)]
 
         # redact every text rect (leaves images intact)
         for r in text_rects:
@@ -553,8 +560,8 @@ def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
         # measure the largest fitting font size (or a truncated prefix) on a
         # scratch page first, then commit a single insert_textbox to the
         # real page so it's guaranteed to succeed
-        fit_fs, fit_text = _fit_textbox(full_area, portions[i], "helv", fs)
-        page.insert_textbox(full_area, fit_text, fontname="helv", fontsize=fit_fs)
+        fit_fs, fit_text = _fit_textbox(full_area, portions[i], fontname, fs)
+        page.insert_textbox(full_area, fit_text, fontname=fontname, fontsize=fit_fs)
 
     buf = io.BytesIO()
     src.save(buf, garbage=4, deflate=True)
