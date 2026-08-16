@@ -454,114 +454,126 @@ def _extract_pdf_text(data: bytes) -> str:
     return "\n\n".join(p.strip() for p in pages if p.strip())
 
 
-def _fit_textbox(rect: "pymupdf.Rect", text: str, fontname: str, max_fs: float, min_fs: float = 7) -> tuple[float, str]:
-    """Find the largest font size (max_fs down to min_fs) at which `text` fits
-    `rect` with insert_textbox, measured on a scratch page so nothing is drawn
-    on the real page yet. insert_textbox writes nothing at all when it doesn't
-    fit, so this must be measured before committing to the real page. If even
-    min_fs overflows, binary-search the longest text prefix that fits."""
+class _LineRecord:
+    __slots__ = ("text", "size", "bold", "italic", "bbox", "baseline_y")
+
+    def __init__(self, text: str, size: float, bold: bool, italic: bool, bbox: "pymupdf.Rect"):
+        self.text = text
+        self.size = size
+        self.bold = bold
+        self.italic = italic
+        self.bbox = bbox
+        self.baseline_y = bbox.y1 - size * 0.8
+
+
+def _page_line_records(page: "pymupdf.Page") -> tuple[list["_LineRecord"], list["pymupdf.Rect"]]:
     import pymupdf
 
-    scratch = pymupdf.open()
-    try:
-        sp = scratch.new_page(width=rect.width, height=rect.height)
-        srect = pymupdf.Rect(0, 0, rect.width, rect.height)
+    blocks = page.get_text("dict")["blocks"]
+    lines: list[_LineRecord] = []
+    text_rects: list[pymupdf.Rect] = []
+    for b in blocks:
+        if b["type"] != 0:  # skip image blocks
+            continue
+        text_rects.append(pymupdf.Rect(b["bbox"]))
+        for line in b["lines"]:
+            spans = line["spans"]
+            line_text = "".join(s["text"] for s in spans)
+            if not line_text.strip():
+                continue
+            dom = max(spans, key=lambda s: len(s["text"]))
+            fname = dom["font"].lower()
+            bold = bool(dom["flags"] & 16) or "bold" in fname
+            italic = bool(dom["flags"] & 2) or "italic" in fname or "oblique" in fname
+            lines.append(_LineRecord(line_text, dom["size"], bold, italic, pymupdf.Rect(line["bbox"])))
+    return lines, text_rects
 
-        fs = max_fs
-        while fs >= min_fs:
-            if sp.insert_textbox(srect, text, fontname=fontname, fontsize=fs) >= 0:
-                return fs, text
-            fs -= 1
 
-        lo, hi, best = 0, len(text), 0
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if sp.insert_textbox(srect, text[:mid], fontname=fontname, fontsize=min_fs) >= 0:
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return min_fs, text[:best]
-    finally:
-        scratch.close()
+def _fit_line_fontsize(text: str, fontname: str, size: float, max_width: float, min_fs: float = 6) -> float:
+    import pymupdf
+
+    fs = size
+    while fs > min_fs and pymupdf.get_text_length(text, fontname=fontname, fontsize=fs) > max_width:
+        fs -= 0.2
+    return round(max(fs, min_fs), 1)
 
 
 def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
-    """Redact text on each page and re-insert rewritten text into the same
-    bounding boxes. Preserves page size, images, and spatial layout."""
+    """Redact each line's text and re-insert the rewritten wording at the same
+    position, font size, and bold/italic style. Preserves page count, page
+    size, images, margins, and per-line typography exactly."""
     import pymupdf
 
     src = pymupdf.open(stream=data, filetype="pdf")
-    page_texts = [src[i].get_text() for i in range(src.page_count)]
-    page_chars = [len(t) for t in page_texts]
-    total = sum(page_chars) or 1
 
-    # proportion rewritten text across pages by original char ratio
-    portions: list[str] = []
-    pos = 0
-    for i, pc in enumerate(page_chars):
-        share = pc / total
-        end = pos + int(len(rewritten_text) * share)
-        if i == len(page_chars) - 1:
-            end = len(rewritten_text)
-        portions.append(rewritten_text[pos:end])
-        pos = end
+    page_lines: list[list[_LineRecord]] = []
+    page_rects: list[list["pymupdf.Rect"]] = []
+    for page in src:
+        lines, rects = _page_line_records(page)
+        page_lines.append(lines)
+        page_rects.append(rects)
 
-    margin = 50
+    rw_words = rewritten_text.split()
+    fontmap = {(False, False): "helv", (True, False): "hebo", (False, True): "heit", (True, True): "hebi"}
 
-    for i, page in enumerate(src):
-        if not portions[i].strip():
+    # single continuous greedy fill across every line of every page in
+    # document order, each line taking as many words as fit its own original
+    # width at its own original font (not a raw word-count match) - a fixed
+    # per-page word budget was tried first and it starves lines whose
+    # rewritten words happen to pack tighter/looser than the page average,
+    # dropping mid-page headers entirely.
+    #
+    # the rewrite is also typically shorter than the original (paraphrasing
+    # compresses), so filling every line to its full width would exhaust the
+    # rewritten words partway through the document and leave every line
+    # after that point (often a whole trailing page) blank. `rho` is the
+    # global compression ratio; capping each line's fill target at
+    # rho * its own width spreads the shortfall as a little trailing
+    # whitespace on every line instead of dumping it all on the tail.
+    total_orig_chars = sum(len(lr.text) for lines in page_lines for lr in lines) or 1
+    rho = min(1.0, len(rewritten_text) / total_orig_chars)
+
+    gi = 0
+    n = len(rw_words)
+    all_lines = [lr for lines in page_lines for lr in lines]
+    all_text: list[str] = []
+    for i, lr in enumerate(all_lines):
+        if i == len(all_lines) - 1:
+            all_text.append(" ".join(rw_words[gi:]))
+            gi = n
             continue
+        fontname = fontmap[(lr.bold, lr.italic)]
+        target_width = (lr.bbox.x1 - lr.bbox.x0) * rho
+        cur = ""
+        while gi < n:
+            candidate = f"{cur} {rw_words[gi]}".strip()
+            if cur and pymupdf.get_text_length(candidate, fontname=fontname, fontsize=lr.size) > target_width:
+                break
+            cur = candidate
+            gi += 1
+        all_text.append(cur)
 
-        blocks = page.get_text("dict")["blocks"]
-        text_rects = []
-        for b in blocks:
-            if b["type"] == 0:
-                text_rects.append(pymupdf.Rect(b["bbox"]))
-        if not text_rects:
+    page_assigned: list[list[str]] = []
+    ti = 0
+    for lines in page_lines:
+        page_assigned.append(all_text[ti:ti + len(lines)])
+        ti += len(lines)
+
+    for pi, page in enumerate(src):
+        lines = page_lines[pi]
+        if not lines:
             continue
-
-        # bounding box of all text on this page
-        area = text_rects[0]
-        for r in text_rects[1:]:
-            area |= r
-
-        # expand to full usable width (left edge of leftmost text to right margin)
-        # and full height (top of first text to bottom margin)
-        page_rect = page.rect
-        full_area = pymupdf.Rect(
-            area.x0 - 4,                # slight padding left
-            margin,                      # top margin
-            page_rect.width - margin,    # right margin
-            page_rect.height - margin    # bottom margin
-        )
-
-        # detect dominant font (size, bold, italic) from the page's spans,
-        # weighted by span text length so the style covering the most text wins
-        fs = 11
-        bold = italic = False
-        try:
-            spans = [sp for b in blocks if b["type"] == 0 for l in b["lines"] for sp in l["spans"]]
-            if spans:
-                dom = max(spans, key=lambda s: len(s["text"]))
-                fs = dom["size"]
-                fname = dom["font"].lower()
-                bold = bool(dom["flags"] & 2**4) or "bold" in fname
-                italic = bool(dom["flags"] & 2**1) or "italic" in fname or "oblique" in fname
-        except Exception:
-            pass
-        fontname = {(False, False): "helv", (True, False): "hebo", (False, True): "heit", (True, True): "hebi"}[(bold, italic)]
-
-        # redact every text rect (leaves images intact)
-        for r in text_rects:
+        for r in page_rects[pi]:
             page.add_redact_annot(r)
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
 
-        # measure the largest fitting font size (or a truncated prefix) on a
-        # scratch page first, then commit a single insert_textbox to the
-        # real page so it's guaranteed to succeed
-        fit_fs, fit_text = _fit_textbox(full_area, portions[i], fontname, fs)
-        page.insert_textbox(full_area, fit_text, fontname=fontname, fontsize=fit_fs)
+        for lr, text in zip(lines, page_assigned[pi]):
+            if not text.strip():
+                continue
+            fontname = fontmap[(lr.bold, lr.italic)]
+            max_width = lr.bbox.x1 - lr.bbox.x0
+            fit_fs = _fit_line_fontsize(text, fontname, lr.size, max_width)
+            page.insert_text((lr.bbox.x0, lr.baseline_y), text, fontname=fontname, fontsize=fit_fs)
 
     buf = io.BytesIO()
     src.save(buf, garbage=4, deflate=True)
