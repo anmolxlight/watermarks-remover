@@ -36,3 +36,9 @@
 posts.md
 *.cleaned.*
 *.bak
+!/api/
+!/api/**
+!api/__pycache__/
+!requirements.txt
+!vercel.json
+.vercel
