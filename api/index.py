@@ -36,11 +36,251 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.responses import JSONResponse, RedirectResponse  # noqa: E402
+from fastapi.responses import HTMLResponse, JSONResponse  # noqa: E402
 
 from text_unicode import clean_text, inspect_text  # noqa: E402  (repo module, stdlib only)
 
 app = FastAPI(title="watermarks-remover", version="1.0.0-vercel")
+
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>watermarks-remover</title>
+<style>
+  :root {
+    --bg: #0a0a0c; --surface: #131316; --surface-2: #1a1a1f;
+    --border: rgba(255,255,255,.08); --border-strong: rgba(255,255,255,.16);
+    --text: #f4f4f5; --muted: #a1a1aa; --dim: #71717a;
+    --accent: #34d399; --accent-strong: #10b981; --accent-dim: rgba(52,211,153,.12);
+    --danger: #f87171; --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100dvh; display: flex; flex-direction: column; align-items: center;
+    padding: 48px 20px 64px;
+  }
+  .wrap { width: 100%; max-width: 640px; }
+  header { margin-bottom: 28px; }
+  header h1 { font-size: 20px; font-weight: 650; letter-spacing: -.02em; }
+  header p { color: var(--muted); font-size: 14px; margin-top: 4px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+  }
+  .drop {
+    border: 1.5px dashed var(--border-strong); border-radius: var(--radius);
+    padding: 36px 20px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+    background: var(--surface-2);
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); }
+  .drop .main { font-size: 15px; font-weight: 550; }
+  .drop .sub { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .drop.filled { border-style: solid; border-color: var(--accent-strong); padding: 22px 20px; }
+  .drop.filled .fname { font-weight: 600; word-break: break-all; }
+  .drop.filled .fmeta { color: var(--dim); font-size: 12.5px; margin-top: 4px; font-family: var(--mono); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 20px; }
+  label.toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; color: var(--text); }
+  label.toggle input { width: 16px; height: 16px; accent-color: var(--accent-strong); cursor: pointer; }
+  .toggle-note { display: block; color: var(--dim); font-size: 12.5px; margin-top: 2px; }
+  button.cta {
+    background: var(--accent-strong); color: #052e1b; border: none; cursor: pointer;
+    font: 600 14px/1 inherit; padding: 11px 22px; border-radius: var(--radius);
+    transition: background .15s, transform .1s; white-space: nowrap; flex-shrink: 0;
+  }
+  button.cta:hover { background: var(--accent); }
+  button.cta:active { transform: scale(.98); }
+  button.cta:disabled { opacity: .5; cursor: default; }
+  button.cta:disabled:active { transform: none; }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px; vertical-align: -2px; margin-right: 8px;
+    border: 2px solid rgba(5,46,27,.35); border-top-color: #052e1b; border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #error { display: none; margin-top: 16px; padding: 12px 14px; border-radius: var(--radius);
+    background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.3); color: var(--danger);
+    font-size: 13.5px; word-break: break-word; }
+  .result { display: none; margin-top: 20px; }
+  .result-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-bottom: 14px; }
+  .result-head .r-title { font-size: 15px; font-weight: 600; }
+  .result-head .r-meta { color: var(--dim); font-size: 12.5px; font-family: var(--mono); margin-top: 2px; }
+  a.download {
+    background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(52,211,153,.35);
+    text-decoration: none; font: 600 13.5px/1 inherit; padding: 9px 16px; border-radius: var(--radius);
+    white-space: nowrap; transition: background .15s;
+  }
+  a.download:hover { background: rgba(52,211,153,.2); }
+  .notes { border-top: 1px solid var(--border); padding-top: 14px; }
+  .notes h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); margin-bottom: 10px; font-weight: 600; }
+  ul.notes-list { list-style: none; }
+  ul.notes-list li {
+    display: flex; gap: 10px; font-size: 13px; color: var(--muted);
+    padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,.04); font-family: var(--mono);
+  }
+  ul.notes-list li:last-child { border-bottom: none; }
+  ul.notes-list li::before { content: "//"; color: var(--accent); flex-shrink: 0; }
+  ul.notes-list li.ok { color: var(--text); }
+  footer { margin-top: 32px; color: var(--dim); font-size: 12.5px; }
+  footer code { font-family: var(--mono); }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--text); }
+  input[type=file] { display: none; }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>watermarks-remover</h1>
+    <p>Strip AI provenance marks from your own files. PDF, text, images, DOCX in; clean versions out.</p>
+  </header>
+  <div class="card">
+    <div class="drop" id="drop" role="button" tabindex="0" aria-label="Choose a file">
+      <div class="main" id="dropMain">Drop a file here</div>
+      <div class="sub" id="dropSub">or click to browse. PDF, text, images, DOCX.</div>
+    </div>
+    <div class="row">
+      <label class="toggle">
+        <input type="checkbox" id="rewrite">
+        <span>Neural rewrite<span class="toggle-note">deepseek-v4-flash paraphrase for statistical text watermarks</span></span>
+      </label>
+      <button class="cta" id="go" disabled>Remove marks</button>
+    </div>
+    <div id="error"></div>
+    <div class="result" id="result">
+      <div class="result-head">
+        <div>
+          <div class="r-title">Cleaned</div>
+          <div class="r-meta" id="rMeta"></div>
+        </div>
+        <a class="download" id="dl" download>Download PDF</a>
+      </div>
+      <div class="notes">
+        <h3>Processing notes</h3>
+        <ul class="notes-list" id="notes"></ul>
+      </div>
+    </div>
+  </div>
+  <footer>
+    <code>/clean</code> JSON API: <code>POST {file: base64, name, options}</code> - <a href="/docs">OpenAPI</a>
+  </footer>
+</div>
+<script>
+(function () {
+  var drop = document.getElementById("drop");
+  var go = document.getElementById("go");
+  var fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = ".pdf,.txt,.md,.html,.png,.jpg,.jpeg,.webp,.gif,.docx,.odt";
+  fileInput.style.display = "none";
+  document.body.appendChild(fileInput);
+  var file = null;
+
+  function pick(f) {
+    if (!f) return;
+    file = f;
+    document.getElementById("dropMain").textContent = f.name;
+    document.getElementById("dropSub").textContent = (f.size / 1024).toFixed(1) + " KB";
+    drop.classList.add("filled");
+    go.disabled = false;
+    hideError();
+  }
+  drop.addEventListener("click", function () { fileInput.click(); });
+  drop.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+  });
+  fileInput.addEventListener("change", function () { pick(fileInput.files[0]); });
+  ["dragover", "dragenter"].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add("over"); });
+  });
+  ["dragleave", "drop"].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove("over"); });
+  });
+  drop.addEventListener("drop", function (e) { pick(e.dataTransfer.files[0]); });
+
+  function showError(msg) {
+    var el = document.getElementById("error");
+    el.textContent = msg;
+    el.style.display = "block";
+  }
+  function hideError() { document.getElementById("error").style.display = "none"; }
+
+  go.addEventListener("click", function () {
+    if (!file) return;
+    var btn = go;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Removing';
+    hideError();
+    var reader = new FileReader();
+    reader.onload = function () {
+      var b64 = reader.result.split(",")[1];
+      var rewrite = document.getElementById("rewrite").checked;
+      fetch("/clean", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: b64, name: file.name, options: { rewrite: rewrite } })
+      }).then(function (r) {
+        return r.json().then(function (j) { return { status: r.status, body: j }; });
+      }).then(function (res) {
+        if (!res.body.ok) { throw new Error(res.body.error || ("HTTP " + res.status)); }
+        var j = res.body;
+        var bin = atob(j.cleaned);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        var blob = new Blob([bytes], { type: "application/octet-stream" });
+        var base = file.name.replace(/\.[^.]+$/, "");
+        var ext = j.kind === "pdf" ? "pdf" : (file.name.split(".").pop() || "bin");
+        var url = URL.createObjectURL(blob);
+        var dl = document.getElementById("dl");
+        dl.href = url;
+        dl.download = base + ".cleaned." + ext;
+        document.getElementById("rMeta").textContent =
+          (file.size / 1024).toFixed(1) + " KB to " + (blob.size / 1024).toFixed(1) + " KB";
+        renderNotes(j.report || {});
+        document.getElementById("result").style.display = "block";
+      }).catch(function (e) {
+        showError("Failed: " + e.message);
+      }).finally(function () {
+        btn.disabled = false;
+        btn.textContent = "Remove marks";
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+
+  function renderNotes(report) {
+    var ul = document.getElementById("notes");
+    ul.innerHTML = "";
+    var lines = [];
+    lines.push("handler: " + (report.handler || "none"));
+    if (report.kind && report.kind !== "pdf") lines.push("kind: " + report.kind);
+    (report.actions || []).forEach(function (a) { lines.push(a); });
+    (report.removed || []).forEach(function (r) { lines.push("removed " + r); });
+    (report.findings || []).forEach(function (f) { lines.push("found " + f); });
+    var stats = report.stats || {};
+    if (typeof stats.removed_count === "number") lines.push("hidden chars removed: " + stats.removed_count);
+    if (stats.suspicious) lines.push("suspicious: " + stats.suspicious);
+    if (report.layer_b) {
+      lines.push("neural rewrite: " + (report.layer_b.rewritten ? "applied via " + (report.layer_b.model || "deepseek-v4-flash") : "skipped (" + (report.layer_b.note || "not requested") + ")"));
+    }
+    if (report.note) lines.push(report.note);
+    if (!lines.length) lines.push("nothing suspicious found");
+    lines.forEach(function (l) {
+      var li = document.createElement("li");
+      li.textContent = l;
+      ul.appendChild(li);
+    });
+  }
+})();
+</script>
+</body>
+</html>
+"""
 
 MAX_INPUT_BYTES = 64 << 20  # 64 MiB decoded-file cap
 
@@ -380,7 +620,7 @@ def health() -> dict[str, Any]:
 
 @app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse("/docs")
+    return HTMLResponse(INDEX_HTML)
 
 
 @app.post("/inspect")
