@@ -530,28 +530,40 @@ def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
     # global compression ratio; capping each line's fill target at
     # rho * its own width spreads the shortfall as a little trailing
     # whitespace on every line instead of dumping it all on the tail.
+    # If the word count still leaves a remainder after a full pass, rho was
+    # overestimated and the leftover words would be dumped on the last line
+    # (shrinking it to fit). Re-fill with a smaller rho until every word is
+    # placed and no line exceed its width.
     total_orig_chars = sum(len(lr.text) for lines in page_lines for lr in lines) or 1
     rho = min(1.0, len(rewritten_text) / total_orig_chars)
-
-    gi = 0
-    n = len(rw_words)
     all_lines = [lr for lines in page_lines for lr in lines]
-    all_text: list[str] = []
-    for i, lr in enumerate(all_lines):
-        if i == len(all_lines) - 1:
-            all_text.append(" ".join(rw_words[gi:]))
-            gi = n
-            continue
-        fontname = fontmap[(lr.bold, lr.italic)]
-        target_width = (lr.bbox.x1 - lr.bbox.x0) * rho
-        cur = ""
-        while gi < n:
-            candidate = f"{cur} {rw_words[gi]}".strip()
-            if cur and pymupdf.get_text_length(candidate, fontname=fontname, fontsize=lr.size) > target_width:
-                break
-            cur = candidate
-            gi += 1
-        all_text.append(cur)
+
+    def fill(rho: float) -> list[str]:
+        gi = 0
+        n = len(rw_words)
+        out: list[str] = []
+        for i, lr in enumerate(all_lines):
+            if gi >= n:
+                out.append("")
+                continue
+            fontname = fontmap[(lr.bold, lr.italic)]
+            target_width = (lr.bbox.x1 - lr.bbox.x0) * rho
+            cur = ""
+            while gi < n:
+                candidate = f"{cur} {rw_words[gi]}".strip()
+                if cur and pymupdf.get_text_length(candidate, fontname=fontname, fontsize=lr.size) > target_width:
+                    break
+                cur = candidate
+                gi += 1
+            out.append(cur)
+        return out
+
+    for _ in range(12):
+        all_text = fill(rho)
+        placed_words = sum(1 for t in all_text for _ in t.split())
+        if placed_words >= len(rw_words):
+            break
+        rho *= 0.94  # not all words fit: fill more tightly next pass
 
     page_assigned: list[list[str]] = []
     ti = 0
@@ -571,7 +583,14 @@ def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
             if not text.strip():
                 continue
             fontname = fontmap[(lr.bold, lr.italic)]
-            max_width = lr.bbox.x1 - lr.bbox.x0
+            # The original line slot width came from the original narrow font
+            # (e.g. SF Pro); the replacement Helvetica is ~15% wider, so a word
+            # that fit its slot before overflows it now and would get shrunk to
+            # 6-8pt for no layout reason. Measure against the PAGE right margin
+            # instead: keep the original size whenever the line stays on the
+            # page, and only shrink what would actually spill past the margin.
+            page_right = max(r.x1 for r in page_rects[pi]) + 4
+            max_width = max(lr.bbox.x1 - lr.bbox.x0, page_right - lr.bbox.x0)
             fit_fs = _fit_line_fontsize(text, fontname, lr.size, max_width)
             page.insert_text((lr.bbox.x0, lr.baseline_y), text, fontname=fontname, fontsize=fit_fs)
 
