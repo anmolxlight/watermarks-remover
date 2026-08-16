@@ -1,3 +1,5 @@
 fastapi
 pikepdf
 pillow
+pymupdf
+python-multipart

@@ -35,7 +35,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
-from fastapi import FastAPI, Request  # noqa: E402
+from fastapi import Body, FastAPI  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse  # noqa: E402
 
 from text_unicode import clean_text, inspect_text  # noqa: E402  (repo module, stdlib only)
@@ -147,7 +147,7 @@ INDEX_HTML = """<!doctype html>
     <div class="row">
       <label class="toggle">
         <input type="checkbox" id="rewrite">
-        <span>Neural rewrite<span class="toggle-note">deepseek-v4-flash paraphrase for statistical text watermarks</span></span>
+        <span>Neural rewrite<span class="toggle-note">mimo-v2.5 paraphrase for statistical text watermarks</span></span>
       </label>
       <button class="cta" id="go" disabled>Remove marks</button>
     </div>
@@ -158,7 +158,10 @@ INDEX_HTML = """<!doctype html>
           <div class="r-title">Cleaned</div>
           <div class="r-meta" id="rMeta"></div>
         </div>
-        <a class="download" id="dl" download>Download PDF</a>
+        <div style="display:flex;gap:10px;align-items:center;flex-shrink:0">
+          <a class="download" id="dlText" download style="display:none">Download rewritten text</a>
+          <a class="download" id="dl" download>Download PDF</a>
+        </div>
       </div>
       <div class="notes">
         <h3>Processing notes</h3>
@@ -214,7 +217,9 @@ INDEX_HTML = """<!doctype html>
     if (!file) return;
     var btn = go;
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Removing';
+    btn.innerHTML = document.getElementById("rewrite").checked
+      ? '<span class="spinner"></span>Removing + rewriting'
+      : '<span class="spinner"></span>Removing';
     hideError();
     var reader = new FileReader();
     reader.onload = function () {
@@ -242,6 +247,14 @@ INDEX_HTML = """<!doctype html>
         document.getElementById("rMeta").textContent =
           (file.size / 1024).toFixed(1) + " KB to " + (blob.size / 1024).toFixed(1) + " KB";
         renderNotes(j.report || {});
+        var dlText = document.getElementById("dlText");
+        if (j.text) {
+          dlText.style.display = "inline-block";
+          dlText.href = URL.createObjectURL(new Blob([j.text], { type: "text/plain;charset=utf-8" }));
+          dlText.download = base + ".rewritten.txt";
+        } else {
+          dlText.style.display = "none";
+        }
         document.getElementById("result").style.display = "block";
       }).catch(function (e) {
         showError("Failed: " + e.message);
@@ -294,9 +307,10 @@ ZIP_EXTS = {".docx", ".odt"}
 REWRITE_SYSTEM_PROMPT = (
     "You are a professional editor. Rewrite the following text to remove "
     "statistical watermark patterns while preserving all facts, numbers, names, "
-    "and structure. Output only the rewritten text."
+    "and structure. Output only the rewritten text. Remove any hidden, "
+    "zero-width, or invisible characters (e.g. U+200B, U+00AD)."
 )
-REWRITE_MODEL = "deepseek-v4-flash"
+REWRITE_MODEL = "mimo-v2.5"
 REWRITE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 
 
@@ -360,7 +374,8 @@ def _layer_b_rewrite(text: str) -> tuple[str, dict[str, Any]]:
                 {"role": "user", "content": text},
             ],
             "temperature": 0.7,
-            "max_tokens": 2000,
+            "max_tokens": 4096,
+            "reasoning_effort": "low",
         }
     ).encode("utf-8")
     # Cloudflare rejects the default Python-urllib UA with 1010; a browser-ish
@@ -376,13 +391,66 @@ def _layer_b_rewrite(text: str) -> tuple[str, dict[str, Any]]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=150) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         # LLM down must not fail the whole clean: return original text.
         return text, {"rewritten": False, "note": f"{type(e).__name__}: {e}"}
-    content = payload["choices"][0]["message"]["content"].strip()
+    content = payload["choices"][0]["message"].get("content") or ""
+    content = content.strip()
+    if not content:
+        # Reasoning model burned the budget (finish_reason: length) or returned
+        # blank: keep the original text, never silently drop content.
+        return text, {"rewritten": False, "note": "empty model output"}
     return content, {"rewritten": True, "model": payload.get("model", REWRITE_MODEL)}
+
+
+def _layer_b_rewrite_chunked(text: str) -> tuple[str, dict[str, Any]]:
+    """Chunked rewrite: one LLM call per ~9000-char paragraph block, up to 4 in
+    parallel. Output keeps original chunk order. A failed chunk degrades to
+    the original text, never a hard error.
+    """
+    import concurrent.futures
+
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for para in text.split("\n\n"):
+        if length + len(para) > 9000 and current:
+            chunks.append("\n\n".join(current))
+            current, length = [], 0
+        current.append(para)
+        length += len(para) + 2
+    if current:
+        chunks.append("\n\n".join(current))
+
+    def one(c: str) -> str:
+        out, _ = _layer_b_rewrite(c)
+        return out
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(one, chunks))
+
+    failures = sum(1 for c, o in zip(chunks, results) if o == c)
+    lb = {
+        "rewritten": failures < len(chunks) and len(chunks) > 0,
+        "model": REWRITE_MODEL,
+        "chunks": len(chunks),
+        "failed_chunks": failures,
+        "note": f"{len(chunks) - failures}/{len(chunks)} chunks rewritten" if len(chunks) > 1 else ("rewritten" if failures == 0 else "rewrite failed"),
+    }
+    return "\n\n".join(results).strip(), lb
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    import pymupdf
+
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        pages = [doc[i].get_text() for i in range(doc.page_count)]
+    finally:
+        doc.close()
+    return "\n\n".join(p.strip() for p in pages if p.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +595,17 @@ def _clean(data: bytes, name: str, options: dict[str, Any]) -> dict[str, Any]:
 
     if kind == "pdf":
         out, report = _clean_pdf(data)
-        return {"kind": "pdf", "cleaned": out, "report": {"handler": "pikepdf", **report}}
+        result: dict[str, Any] = {"kind": "pdf", "cleaned": out, "report": {"handler": "pikepdf", **report}}
+        if rewrite:
+            text = _extract_pdf_text(data)
+            if len(text) > 200:
+                rewritten, lb = _layer_b_rewrite_chunked(text)
+                result["report"]["layer_b"] = lb
+                if lb.get("rewritten"):
+                    result["text"] = rewritten
+            else:
+                result["report"]["layer_b"] = {"rewritten": False, "note": "no extractable text" if not text else "text too short"}
+        return result
 
     if kind == "image":
         out, report = _clean_image(data)
@@ -624,9 +702,8 @@ def root():
 
 
 @app.post("/inspect")
-async def inspect(req: Request):
+def inspect(payload: dict = Body(...)):
     try:
-        payload = await req.json()
         data, name = _decode_body(payload)
     except Exception as e:
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
@@ -640,9 +717,8 @@ async def inspect(req: Request):
 
 
 @app.post("/clean")
-async def clean(req: Request):
+def clean(payload: dict = Body(...)):
     try:
-        payload = await req.json()
         data, name = _decode_body(payload)
         options = payload.get("options") or {}
     except Exception as e:
@@ -654,6 +730,7 @@ async def clean(req: Request):
             "kind": result["kind"],
             "cleaned": base64.b64encode(result["cleaned"]).decode("ascii"),
             "report": result["report"],
+            **({"text": result["text"]} if result.get("text") else {}),
         }
     except ValueError as e:
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
