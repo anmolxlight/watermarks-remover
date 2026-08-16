@@ -454,50 +454,112 @@ def _extract_pdf_text(data: bytes) -> str:
     return "\n\n".join(p.strip() for p in pages if p.strip())
 
 
-def _text_to_pdf(text: str, page_width: float = 595, page_height: float = 842) -> bytes:
-    """Generate a clean PDF from rewritten text, paginated with margins."""
+def _fit_textbox(rect: "pymupdf.Rect", text: str, fontname: str, max_fs: float, min_fs: float = 7) -> tuple[float, str]:
+    """Find the largest font size (max_fs down to min_fs) at which `text` fits
+    `rect` with insert_textbox, measured on a scratch page so nothing is drawn
+    on the real page yet. insert_textbox writes nothing at all when it doesn't
+    fit, so this must be measured before committing to the real page. If even
+    min_fs overflows, binary-search the longest text prefix that fits."""
     import pymupdf
 
-    doc = pymupdf.open()
-    margin = 60
-    font = "helv"  # Helvetica
-    fontsize = 11
-    leading = 16
-    usable_w = page_width - 2 * margin
-    usable_h = page_height - 2 * margin
-    lines_per_page = int(usable_h / leading)
+    scratch = pymupdf.open()
+    try:
+        sp = scratch.new_page(width=rect.width, height=rect.height)
+        srect = pymupdf.Rect(0, 0, rect.width, rect.height)
 
-    # split text into visual lines (wrap at ~95 chars)
-    raw_lines = text.split("\n")
-    wrapped: list[str] = []
-    for rl in raw_lines:
-        if len(rl) <= 95:
-            wrapped.append(rl)
-        else:
-            words = rl.split()
-            cur = ""
-            for w in words:
-                test = (cur + " " + w).strip()
-                if len(test) > 95:
-                    wrapped.append(cur)
-                    cur = w
-                else:
-                    cur = test
-            if cur:
-                wrapped.append(cur)
+        fs = max_fs
+        while fs >= min_fs:
+            if sp.insert_textbox(srect, text, fontname=fontname, fontsize=fs) >= 0:
+                return fs, text
+            fs -= 1
 
-    # paginate
-    for i in range(0, max(1, len(wrapped)), lines_per_page):
-        page = doc.new_page(width=page_width, height=page_height)
-        chunk = wrapped[i:i + lines_per_page]
-        y = margin + fontsize
-        for line in chunk:
-            page.insert_text((margin, y), line, fontname=font, fontsize=fontsize)
-            y += leading
+        lo, hi, best = 0, len(text), 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if sp.insert_textbox(srect, text[:mid], fontname=fontname, fontsize=min_fs) >= 0:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return min_fs, text[:best]
+    finally:
+        scratch.close()
 
-    buf = doc.tobytes(garbage=4, deflate=True)
-    doc.close()
-    return buf
+
+def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
+    """Redact text on each page and re-insert rewritten text into the same
+    bounding boxes. Preserves page size, images, and spatial layout."""
+    import pymupdf
+
+    src = pymupdf.open(stream=data, filetype="pdf")
+    page_texts = [src[i].get_text() for i in range(src.page_count)]
+    page_chars = [len(t) for t in page_texts]
+    total = sum(page_chars) or 1
+
+    # proportion rewritten text across pages by original char ratio
+    portions: list[str] = []
+    pos = 0
+    for i, pc in enumerate(page_chars):
+        share = pc / total
+        end = pos + int(len(rewritten_text) * share)
+        if i == len(page_chars) - 1:
+            end = len(rewritten_text)
+        portions.append(rewritten_text[pos:end])
+        pos = end
+
+    margin = 50
+
+    for i, page in enumerate(src):
+        if not portions[i].strip():
+            continue
+
+        blocks = page.get_text("dict")["blocks"]
+        text_rects = []
+        for b in blocks:
+            if b["type"] == 0:
+                text_rects.append(pymupdf.Rect(b["bbox"]))
+        if not text_rects:
+            continue
+
+        # bounding box of all text on this page
+        area = text_rects[0]
+        for r in text_rects[1:]:
+            area |= r
+
+        # expand to full usable width (left edge of leftmost text to right margin)
+        # and full height (top of first text to bottom margin)
+        page_rect = page.rect
+        full_area = pymupdf.Rect(
+            area.x0 - 4,                # slight padding left
+            margin,                      # top margin
+            page_rect.width - margin,    # right margin
+            page_rect.height - margin    # bottom margin
+        )
+
+        # detect font size from first span on page
+        fs = 11
+        try:
+            spans = blocks[0]["lines"][0]["spans"]
+            if spans:
+                fs = spans[0]["size"]
+        except Exception:
+            pass
+
+        # redact every text rect (leaves images intact)
+        for r in text_rects:
+            page.add_redact_annot(r)
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
+
+        # measure the largest fitting font size (or a truncated prefix) on a
+        # scratch page first, then commit a single insert_textbox to the
+        # real page so it's guaranteed to succeed
+        fit_fs, fit_text = _fit_textbox(full_area, portions[i], "helv", fs)
+        page.insert_textbox(full_area, fit_text, fontname="helv", fontsize=fit_fs)
+
+    buf = io.BytesIO()
+    src.save(buf, garbage=4, deflate=True)
+    src.close()
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +712,10 @@ def _clean(data: bytes, name: str, options: dict[str, Any]) -> dict[str, Any]:
                 result["report"]["layer_b"] = lb
                 if lb.get("rewritten"):
                     result["text"] = rewritten
-                    result["cleaned"] = _text_to_pdf(rewritten)
+                    try:
+                        result["cleaned"] = _rewrite_pdf_layout(out, rewritten)
+                    except Exception as e:
+                        result["report"]["layer_b"]["layout_rewrite_error"] = str(e)
             else:
                 result["report"]["layer_b"] = {"rewritten": False, "note": "no extractable text" if not text else "text too short"}
         return result
