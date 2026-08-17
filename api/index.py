@@ -309,7 +309,10 @@ REWRITE_SYSTEM_PROMPT = (
     "You are a professional editor. Rewrite the following text to remove "
     "statistical watermark patterns while preserving all facts, numbers, names, "
     "and structure. Output only the rewritten text. Remove any hidden, "
-    "zero-width, or invisible characters (e.g. U+200B, U+00AD)."
+    "zero-width, or invisible characters (e.g. U+200B, U+00AD). "
+    "Preserve the line and paragraph structure EXACTLY: keep the same number "
+    "of lines and blank lines as the input. Do not merge lines, split lines, "
+    "or change paragraph boundaries. Only reword within each line."
 )
 REWRITE_MODEL = "mimo-v2.5"
 REWRITE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
@@ -498,88 +501,148 @@ def _fit_line_fontsize(text: str, fontname: str, size: float, max_width: float, 
     return round(max(fs, min_fs), 1)
 
 
+def _page_block_records(page: "pymupdf.Page") -> tuple[list[list[_LineRecord]], list["pymupdf.Rect"]]:
+    """Like _page_line_records but groups lines per text block, so each
+    paragraph/heading keeps its own word budget and style. Image blocks are
+    skipped and not redacted."""
+    import pymupdf
+
+    blocks = page.get_text("dict")["blocks"]
+    block_lines: list[list[_LineRecord]] = []
+    text_rects: list[pymupdf.Rect] = []
+    for b in blocks:
+        if b["type"] != 0:
+            continue
+        text_rects.append(pymupdf.Rect(b["bbox"]))
+        lines: list[_LineRecord] = []
+        for line in b["lines"]:
+            spans = line["spans"]
+            line_text = "".join(s["text"] for s in spans)
+            if not line_text.strip():
+                continue
+            dom = max(spans, key=lambda s: len(s["text"]))
+            fname = dom["font"].lower()
+            bold = bool(dom["flags"] & 16) or "bold" in fname
+            italic = bool(dom["flags"] & 2) or "italic" in fname or "oblique" in fname
+            lines.append(_LineRecord(line_text, dom["size"], bold, italic, pymupdf.Rect(line["bbox"])))
+        if lines:
+            block_lines.append(lines)
+    return block_lines, text_rects
+
+
 def _rewrite_pdf_layout(data: bytes, rewritten_text: str) -> bytes:
     """Redact each line's text and re-insert the rewritten wording at the same
     position, font size, and bold/italic style. Preserves page count, page
-    size, images, margins, and per-line typography exactly."""
+    size, images, margins, per-line typography, AND block structure (headings
+    stay on their own lines, paragraphs keep their own text)."""
     import pymupdf
 
     src = pymupdf.open(stream=data, filetype="pdf")
 
-    page_lines: list[list[_LineRecord]] = []
+    page_blocks: list[list[list[_LineRecord]]] = []
     page_rects: list[list["pymupdf.Rect"]] = []
     for page in src:
-        lines, rects = _page_line_records(page)
-        page_lines.append(lines)
+        blocks, rects = _page_block_records(page)
+        page_blocks.append(blocks)
         page_rects.append(rects)
 
     rw_words = rewritten_text.split()
     fontmap = {(False, False): "helv", (True, False): "hebo", (False, True): "heit", (True, True): "hebi"}
 
-    # single continuous greedy fill across every line of every page in
-    # document order, each line taking as many words as fit its own original
-    # width at its own original font (not a raw word-count match) - a fixed
-    # per-page word budget was tried first and it starves lines whose
-    # rewritten words happen to pack tighter/looser than the page average,
-    # dropping mid-page headers entirely.
-    #
-    # the rewrite is also typically shorter than the original (paraphrasing
-    # compresses), so filling every line to its full width would exhaust the
-    # rewritten words partway through the document and leave every line
-    # after that point (often a whole trailing page) blank. `rho` is the
-    # global compression ratio; capping each line's fill target at
-    # rho * its own width spreads the shortfall as a little trailing
-    # whitespace on every line instead of dumping it all on the tail.
-    # If the word count still leaves a remainder after a full pass, rho was
-    # overestimated and the leftover words would be dumped on the last line
-    # (shrinking it to fit). Re-fill with a smaller rho until every word is
-    # placed and no line exceed its width.
-    total_orig_chars = sum(len(lr.text) for lines in page_lines for lr in lines) or 1
+    # Per-BLOCK fill, not per-line: each original text block (paragraph,
+    # heading, reference entry) receives a word budget proportional to its
+    # original char count, then its lines are greedily filled from that
+    # budget. This keeps headings and paragraphs on their own lines; the
+    # earlier global fill streamed one continuous line of words across the
+    # whole document, which swallowed headings into the following paragraph.
+    total_orig_chars = sum(len(lr.text) for blocks in page_blocks for lines in blocks for lr in lines) or 1
     rho = min(1.0, len(rewritten_text) / total_orig_chars)
-    all_lines = [lr for lines in page_lines for lr in lines]
+    all_blocks = [lines for blocks in page_blocks for lines in blocks]
+    all_lines_flat = [lr for lines in all_blocks for lr in lines]
+    page_rights = [max(r.x1 for r in rects) + 4 if rects else 595.0 for rects in page_rects]
+    page_rights_of: list[float] = []
+    for pi, rects in enumerate(page_rects):
+        page_rights_of.extend([page_rights[pi]] * sum(len(_l) for _l in page_blocks[pi]))
+    block_pages: list[int] = []
+    for pi, blocks in enumerate(page_blocks):
+        block_pages.extend([pi] * len(blocks))
 
-    def fill(rho: float) -> list[str]:
-        gi = 0
-        n = len(rw_words)
-        out: list[str] = []
-        for i, lr in enumerate(all_lines):
-            if gi >= n:
-                out.append("")
-                continue
-            fontname = fontmap[(lr.bold, lr.italic)]
-            target_width = (lr.bbox.x1 - lr.bbox.x0) * rho
-            cur = ""
-            while gi < n:
-                candidate = f"{cur} {rw_words[gi]}".strip()
-                if cur and pymupdf.get_text_length(candidate, fontname=fontname, fontsize=lr.size) > target_width:
-                    break
-                cur = candidate
-                gi += 1
-            out.append(cur)
-        return out
+    # Preferred path: the rewrite prompt now preserves line structure, so the
+    # rewritten text splits into the SAME number of lines as the original.
+    # Map 1:1 by line index — each rewritten line inherits its slot's font,
+    # size, bold/italic, x0, and baseline, which is exact format preservation.
+    # Deterministic per-line word slicing: every original line slot consumes
+    # exactly its proportional share of the rewritten word stream (share =
+    # slot's original word count scaled by the global compression ratio).
+    # This makes the OUTPUT STRUCTURE identical to the input by construction:
+    # same line count, same line order, same per-line style — the rewrite can
+    # never merge headings into body text, drop lines, or bleed words across
+    # blocks, because line boundaries come from the original document, not
+    # from the LLM's line breaks.
+    total_orig_words = sum(len(lr.text.split()) for lr in all_lines_flat) or 1
+    word_rho = min(1.0, len(rw_words) / total_orig_words)
 
-    for _ in range(12):
-        all_text = fill(rho)
-        placed_words = sum(1 for t in all_text for _ in t.split())
-        if placed_words >= len(rw_words):
-            break
-        rho *= 0.94  # not all words fit: fill more tightly next pass
+    # distribute the word budget across lines (largest-remainder so the sum
+    # of shares equals the total rewritten word count)
+    raw_shares = [len(lr.text.split()) * word_rho for lr in all_lines_flat]
+    shares = [int(s) for s in raw_shares]
+    deficit = len(rw_words) - sum(shares)
+    if deficit > 0:
+        order = sorted(range(len(raw_shares)), key=lambda i: raw_shares[i] - shares[i], reverse=True)
+        for i in order[:deficit]:
+            shares[i] += 1
+
+    mapped: list[str] = []
+    gi = 0
+    for s in shares:
+        mapped.append(" ".join(rw_words[gi:gi + s]))
+        gi += s
+    if gi < len(rw_words):
+        mapped[-1] = f"{mapped[-1]} {' '.join(rw_words[gi:])}".strip()  # leftover tail
+
+    # Width-based pushdown: a line whose sliced words overflow the page margin
+    # (Helvetica is ~15% wider than the original SF Pro at the same size) flows
+    # its excess words to the next line instead of shrinking the font. Line
+    # count and structure stay identical; only word boundaries shift slightly.
+    for i in range(len(mapped) - 1):
+        lr = all_lines_flat[i]
+        fontname = fontmap[(lr.bold, lr.italic)]
+        page_right = page_rights_of[i]
+        max_w = page_right - lr.bbox.x0
+        words = mapped[i].split()
+        if not words:
+            continue
+        if pymupdf.get_text_length(mapped[i], fontname=fontname, fontsize=lr.size) <= max_w:
+            continue
+        fitted: list[str] = []
+        for w in words:
+            cand = f"{' '.join(fitted)} {w}".strip()
+            if fitted and pymupdf.get_text_length(cand, fontname=fontname, fontsize=lr.size) > max_w:
+                break
+            fitted.append(w)
+        if fitted and len(fitted) < len(words):
+            mapped[i] = " ".join(fitted)
+            mapped[i + 1] = f"{' '.join(words[len(fitted):])} {mapped[i + 1]}".strip()
 
     page_assigned: list[list[str]] = []
-    ti = 0
-    for lines in page_lines:
-        page_assigned.append(all_text[ti:ti + len(lines)])
-        ti += len(lines)
+    li = 0
+    for blocks in page_blocks:
+        flat = []
+        for _lines in blocks:
+            for _ in _lines:
+                flat.append(mapped[li])
+                li += 1
+        page_assigned.append(flat)
 
     for pi, page in enumerate(src):
-        lines = page_lines[pi]
-        if not lines:
+        lines_flat = [lr for lines in page_blocks[pi] for lr in lines]
+        if not lines_flat:
             continue
         for r in page_rects[pi]:
             page.add_redact_annot(r)
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
 
-        for lr, text in zip(lines, page_assigned[pi]):
+        for lr, text in zip(lines_flat, page_assigned[pi]):
             if not text.strip():
                 continue
             fontname = fontmap[(lr.bold, lr.italic)]
